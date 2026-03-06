@@ -14,14 +14,14 @@ Skrip ini menjadi alternatif gratis menggunakan **Google Apps Script** yang berj
 
 | Fitur | Keterangan |
 |-------|-----------|
-| 🔍 **Scan file baru** | Deteksi file yang baru dibuat/diunggah setiap 5 menit |
-| 🔗 **Cek sharing permission** | Deteksi file yang dibagikan ke publik atau domain eksternal |
-| 📝 **Scan nama file** | Cocokkan nama file dengan kata kunci sensitif |
-| 📄 **Scan konten** | Baca isi Google Docs & Sheets, cari pola data sensitif |
-| 👁️ **Monitor aktivitas** | Pantau semua aktivitas pada file yang sudah di-flag |
-| 🔒 **Auto-revoke** | Cabut permission otomatis saat pelanggaran terdeteksi *(opsional)* |
-| 🧹 **Auto-cleanup** | Hapus otomatis flag lama setiap minggu |
-| 📧 **Email alert** | Notifikasi langsung ke admin saat ada pelanggaran |
+| **Scan file baru** | Deteksi file yang baru dibuat/diunggah setiap 5 menit |
+| **Cek sharing permission** | Deteksi file yang dibagikan ke publik atau domain eksternal |
+| **Scan nama file** | Cocokkan nama file dengan kata kunci sensitif |
+| **Scan konten** | Baca isi Google Docs & Sheets, cari pola data sensitif |
+| **Monitor aktivitas** | Pantau semua aktivitas pada file yang sudah di-flag |
+| **Auto-revoke** | Cabut permission otomatis saat pelanggaran terdeteksi *(opsional)* |
+| **Auto-cleanup** | Hapus otomatis flag lama setiap minggu |
+| **Email alert** | Notifikasi langsung ke admin saat ada pelanggaran |
 
 ---
 
@@ -108,7 +108,7 @@ const CONFIG = {
 
 Pilih fungsi `createTrigger` di dropdown → klik **Run** → authorize permissions
 
-✅ Selesai. Skrip berjalan otomatis.
+Selesai. Skrip berjalan otomatis.
 
 ---
 
@@ -153,11 +153,11 @@ Aktivitas Terbaru:
 
 ## Limitasi
 
-- ⏱️ **Delay ~5 menit** — bukan real-time seperti solusi enterprise
-- 📄 **Scan konten terbatas** — hanya Google Docs & Sheets native; PDF/Office tidak bisa di-scan isinya
-- 👤 **Resolusi identitas** — pengguna eksternal mungkin tampil sebagai ID, bukan email
-- ⚡ **Quota GAS** — limit 90 menit eksekusi/hari (akun gratis), 6 jam/hari (Workspace)
-- 💾 **Storage flag** — menggunakan PropertiesService, limit 500KB (~ratusan file)
+- **Delay ~5 menit** — bukan real-time seperti solusi enterprise
+- **Scan konten terbatas** — hanya Google Docs & Sheets native; PDF/Office tidak bisa di-scan isinya
+- **Resolusi identitas** — pengguna eksternal mungkin tampil sebagai ID, bukan email
+- **Quota GAS** — limit 90 menit eksekusi/hari (akun gratis), 6 jam/hari (Workspace)
+- **Storage flag** — menggunakan PropertiesService, limit 500KB (~ratusan file)
 
 ---
 
@@ -181,8 +181,6 @@ Kontribusi sangat disambut! Beberapa ide yang bisa dikembangkan:
 - [ ] Scan file PDF & Office via Google Drive export
 - [ ] Integrasi log ke Wazuh atau Graylog
 - [ ] Support untuk Google Shared Drive (Team Drive)
-
-Silakan buka **Issue** atau **Pull Request**.
 
 ---
 

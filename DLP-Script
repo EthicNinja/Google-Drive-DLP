@@ -1,0 +1,544 @@
+// ============================================================
+// GOOGLE DRIVE DLP SCANNER
+// By: Ethic Ninja (https://ethic.ninja)
+//
+// FITUR:
+// - Scan file baru yang di-upload/create
+// - Deteksi sharing public/eksternal
+// - Scan nama file mengandung kata sensitif
+// - Scan konten Google Docs & Sheets
+// - Auto-revoke sharing (opsional)
+// - Alert email ke admin saat violation
+// - Monitor semua aktivitas pada file yang di-flag
+// - Auto-cleanup flagged files lama
+//
+// SETUP:
+// 1. Services (+) -> tambahkan Drive API v3
+// 2. Services (+) -> tambahkan Drive Activity API
+// 3. Services (+) -> tambahkan People API
+// 4. Jalankan createTrigger() sekali
+// ============================================================
+
+
+// ============================================================
+// KONFIGURASI
+// ============================================================
+const CONFIG = {
+  ADMIN_EMAIL: 'contoh@perusahaan.com',
+  YOUR_DOMAIN: '@perusahaan.com',
+  SCAN_INTERVAL_MINUTES: 5,
+  ACTIVITY_CHECK_INTERVAL_MINUTES: 15,
+  CLEANUP_DAYS: 30,         // Hapus flag file yang lebih dari X hari
+  AUTO_REVOKE: false        // true = auto-block sharing, false = alert saja
+};
+
+
+// ============================================================
+// SETUP TRIGGER - Jalankan sekali saja
+// ============================================================
+function createTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger('scanNewFiles')
+    .timeBased()
+    .everyMinutes(CONFIG.SCAN_INTERVAL_MINUTES)
+    .create();
+
+  ScriptApp.newTrigger('scanFileActivity')
+    .timeBased()
+    .everyMinutes(CONFIG.ACTIVITY_CHECK_INTERVAL_MINUTES)
+    .create();
+
+  ScriptApp.newTrigger('cleanOldFlaggedFiles')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.MONDAY)  // <- tambahkan ini
+    .atHour(1)                             // <- jam 1 pagi
+    .create();
+
+  Logger.log('Trigger aktif:');
+  Logger.log('  scanNewFiles() setiap ' + CONFIG.SCAN_INTERVAL_MINUTES + ' menit');
+  Logger.log('  scanFileActivity() setiap ' + CONFIG.ACTIVITY_CHECK_INTERVAL_MINUTES + ' menit');
+  Logger.log('  cleanOldFlaggedFiles() setiap Senin jam 01.00 WIB');
+}
+
+
+// ============================================================
+// UTILITY: Lihat trigger aktif
+// ============================================================
+function listActiveTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+
+  if (triggers.length === 0) {
+    Logger.log('Tidak ada trigger aktif.');
+    return;
+  }
+
+  triggers.forEach((trigger, index) => {
+    Logger.log(
+      '#' + (index + 1) +
+      ' | Function: ' + trigger.getHandlerFunction() +
+      ' | Type: ' + trigger.getEventType() +
+      ' | ID: ' + trigger.getUniqueId()
+    );
+  });
+}
+
+
+// ============================================================
+// MAIN: SCAN FILE BARU SAJA
+// ============================================================
+function scanNewFiles() {
+  const violations = [];
+  const lookback = new Date(Date.now() - (CONFIG.SCAN_INTERVAL_MINUTES + 1) * 60 * 1000);
+  const query = "createdTime > '" + lookback.toISOString() + "' and trashed = false";
+
+  let pageToken = null;
+  do {
+    const response = Drive.Files.list({
+      q: query,
+      fields: 'nextPageToken, files(id, name, mimeType, permissions, webViewLink, createdTime)',
+      pageToken: pageToken,
+      pageSize: 100
+    });
+
+    (response.files || []).forEach(file => {
+      const fileViolations = [];
+
+      const sharingIssue = checkSharing(file);
+      if (sharingIssue) fileViolations.push(sharingIssue);
+
+      const nameIssue = checkFileName(file.name);
+      if (nameIssue) fileViolations.push(nameIssue);
+
+      const contentIssue = checkFileContent(file);
+      if (contentIssue) fileViolations.push(contentIssue);
+
+      if (fileViolations.length > 0) {
+        violations.push({ file, issues: fileViolations });
+        saveViolatingFile(file.id, file.name);
+
+        if (CONFIG.AUTO_REVOKE) {
+          revokeViolatingPermissions(file);
+        }
+      }
+    });
+
+    pageToken = response.nextPageToken;
+  } while (pageToken);
+
+  if (violations.length > 0) {
+    sendViolationAlert(violations);
+    Logger.log('[DLP] ' + violations.length + ' file bermasalah. Alert dikirim ke ' + CONFIG.ADMIN_EMAIL);
+  } else {
+    Logger.log('[DLP] Scan selesai. Tidak ada file baru yang bermasalah.');
+  }
+}
+
+
+// ============================================================
+// CHECK 1: SHARING PERMISSION
+// ============================================================
+function checkSharing(file) {
+  const permissions = file.permissions || [];
+
+  for (const perm of permissions) {
+    if (perm.type === 'anyone') {
+      return 'File dapat diakses SIAPA SAJA di internet (public link)';
+    }
+    if (perm.type === 'user' && perm.emailAddress && !perm.emailAddress.endsWith(CONFIG.YOUR_DOMAIN)) {
+      return 'Di-share ke eksternal: ' + perm.emailAddress;
+    }
+  }
+  return null;
+}
+
+
+// ============================================================
+// CHECK 2: NAMA FILE
+// ============================================================
+function checkFileName(name) {
+  const sensitiveKeywords = [
+    /password/i, /passwd/i, /kredensial/i, /credential/i,
+    /confidential/i, /rahasia/i, /secret/i,
+    /salary/i, /gaji/i, /payroll/i,
+    /ktp/i, /passport/i, /paspor/i,
+    /kartu.kredit/i, /credit.card/i,
+    /private.?key/i, /id.?rsa/i,
+    /api.?key/i, /token/i, /bearer/i
+  ];
+
+  for (const pattern of sensitiveKeywords) {
+    if (pattern.test(name)) {
+      return 'Nama file mengandung kata sensitif: "' + name + '"';
+    }
+  }
+  return null;
+}
+
+
+// ============================================================
+// CHECK 3: KONTEN FILE (Google Docs & Sheets saja)
+// ============================================================
+function checkFileContent(file) {
+  try {
+    let text = '';
+
+    if (file.mimeType === 'application/vnd.google-apps.document') {
+      text = DocumentApp.openById(file.id).getBody().getText();
+
+    } else if (file.mimeType === 'application/vnd.google-apps.spreadsheet') {
+      const ss = SpreadsheetApp.openById(file.id);
+      ss.getSheets().forEach(sheet => {
+        text += sheet.getDataRange().getValues().flat().join(' ');
+      });
+
+    } else {
+      return null;
+    }
+
+    const patterns = [
+      { name: 'Nomor Kartu Kredit',  regex: /\b(?:\d[ -]?){13,16}\b/ },
+      { name: 'NIK (16 digit)',       regex: /\b\d{16}\b/ },
+      { name: 'Password plaintext',   regex: /password\s*[:=]\s*\S+/i },
+      { name: 'Private Key',          regex: /-----BEGIN (RSA |EC )?PRIVATE KEY-----/ },
+      { name: 'API Key',              regex: /(?:api[_-]?key|apikey|token)\s*[:=]\s*['"]\S{20,}['"]/i },
+      { name: 'AWS Access Key',       regex: /AKIA[0-9A-Z]{16}/ },
+      { name: 'Nomor Paspor RI',      regex: /\b[A-C]\d{7}\b/ },
+      { name: 'Nomor Rekening',       regex: /\b\d{10,16}\b/ }
+    ];
+
+    const found = patterns.filter(p => p.regex.test(text)).map(p => p.name);
+    return found.length > 0 ? 'Konten sensitif terdeteksi: ' + found.join(', ') : null;
+
+  } catch (e) {
+    Logger.log('[DLP] Tidak bisa scan konten: ' + file.name + ' - ' + e.message);
+    return null;
+  }
+}
+
+
+// ============================================================
+// AUTO-REVOKE: Hapus sharing public/eksternal
+// ============================================================
+function revokeViolatingPermissions(file) {
+  try {
+    const permissions = Drive.Permissions.list(file.id, {
+      fields: 'permissions(id, type, emailAddress, role)'
+    }).permissions || [];
+
+    permissions.forEach(perm => {
+      try {
+        if (perm.type === 'anyone') {
+          Drive.Permissions.remove(file.id, perm.id);
+          Logger.log('[DLP] Revoked public access: ' + file.name);
+        }
+        if (perm.type === 'user' && perm.emailAddress && !perm.emailAddress.endsWith(CONFIG.YOUR_DOMAIN)) {
+          Drive.Permissions.remove(file.id, perm.id);
+          Logger.log('[DLP] Revoked external access (' + perm.emailAddress + '): ' + file.name);
+        }
+      } catch (e) {
+        Logger.log('[DLP] Gagal revoke permission: ' + file.name + ' - ' + e.message);
+      }
+    });
+  } catch (e) {
+    Logger.log('[DLP] Gagal list permissions: ' + file.name + ' - ' + e.message);
+  }
+}
+
+
+// ============================================================
+// STORAGE: Simpan & kelola file yang di-flag
+// ============================================================
+function saveViolatingFile(fileId, fileName) {
+  const props = PropertiesService.getScriptProperties();
+  const existing = JSON.parse(props.getProperty('violatingFiles') || '[]');
+
+  if (!existing.find(f => f.id === fileId)) {
+    existing.push({
+      id: fileId,
+      name: fileName,
+      flaggedAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString() // <- tambahan
+    });
+    props.setProperty('violatingFiles', JSON.stringify(existing));
+    Logger.log('[DLP] File di-flag untuk monitoring: ' + fileName);
+  }
+}
+
+function getViolatingFiles() {
+  return JSON.parse(PropertiesService.getScriptProperties().getProperty('violatingFiles') || '[]');
+}
+
+function clearViolatingFiles() {
+  PropertiesService.getScriptProperties().deleteProperty('violatingFiles');
+  Logger.log('[DLP] Daftar file yang di-flag telah dihapus.');
+}
+
+function viewFlaggedFiles() {
+  const files = getViolatingFiles();
+  if (files.length === 0) {
+    Logger.log('[DLP] Tidak ada file yang sedang di-flag.');
+    return;
+  }
+  Logger.log('[DLP] Total file di-flag: ' + files.length);
+  files.forEach((f, i) => {
+    Logger.log('#' + (i + 1) + ' | ' + f.name + ' | ID: ' + f.id + ' | Flagged: ' + f.flaggedAt);
+  });
+}
+
+function cleanOldFlaggedFiles() {
+  const props = PropertiesService.getScriptProperties();
+  const files = JSON.parse(props.getProperty('violatingFiles') || '[]');
+  const cutoff = new Date(Date.now() - CONFIG.CLEANUP_DAYS * 24 * 60 * 60 * 1000);
+
+  const filtered = files.filter(f => new Date(f.flaggedAt) > cutoff);
+  props.setProperty('violatingFiles', JSON.stringify(filtered));
+
+  Logger.log('[DLP] Cleanup: ' + (files.length - filtered.length) + ' file lama dihapus, ' + filtered.length + ' tersisa.');
+}
+
+
+// ============================================================
+// MONITOR ACTIVITY: Scan semua aktivitas file yang di-flag
+// ============================================================
+function scanFileActivity() {
+  const violatingFiles = getViolatingFiles();
+
+  if (violatingFiles.length === 0) {
+    Logger.log('[DLP] Tidak ada file yang sedang dimonitor.');
+    return;
+  }
+
+  violatingFiles.forEach(file => {
+    const activities = checkFileActivity(file.id, file.name);
+    if (activities && activities.length > 0) {
+      sendActivityAlert(file, activities);
+      Logger.log('[DLP] Aktivitas terdeteksi pada: ' + file.name + ' (' + activities.length + ' aktivitas)');
+    }
+  });
+}
+
+function checkFileActivity(fileId, fileName) {
+  try {
+    // Ambil lastActivityAt dari storage
+    const props = PropertiesService.getScriptProperties();
+    const files = JSON.parse(props.getProperty('violatingFiles') || '[]');
+    const fileRecord = files.find(f => f.id === fileId);
+    const lastChecked = fileRecord ? new Date(fileRecord.lastActivityAt) : new Date(0);
+
+    const response = DriveActivity.Activity.query({
+      itemName: 'items/' + fileId,
+      pageSize: 20
+    });
+
+    const activities = response.activities || [];
+    if (activities.length === 0) return null;
+
+    const actionLabels = {
+      'edit': '[Edit]', 'create': '[Create]', 'delete': '[Delete]',
+      'restore': '[Restore]', 'rename': '[Rename]', 'move': '[Move]',
+      'copy': '[Copy]', 'download': '[Download]',
+      'permissionChange': '[Permission Change]',
+      'comment': '[Comment]', 'dlpChange': '[DLP Change]', 'reference': '[View]'
+    };
+
+    // Filter hanya aktivitas BARU setelah lastActivityAt
+    const newActivities = activities.filter(activity => {
+      const timestamp = activity.timestamp || (activity.timeRange && activity.timeRange.endTime);
+      return timestamp && new Date(timestamp) > lastChecked;
+    });
+
+    if (newActivities.length === 0) return null;
+
+    // Update lastActivityAt ke aktivitas terbaru
+    const latestTimestamp = newActivities
+      .map(a => new Date(a.timestamp || a.timeRange?.endTime))
+      .sort((a, b) => b - a)[0];
+
+    const updatedFiles = files.map(f => {
+      if (f.id === fileId) {
+        return { ...f, lastActivityAt: latestTimestamp.toISOString() };
+      }
+      return f;
+    });
+    props.setProperty('violatingFiles', JSON.stringify(updatedFiles));
+
+    return newActivities.map(activity => {
+      const actor = activity.actors && activity.actors[0];
+      const timestamp = activity.timestamp || (activity.timeRange && activity.timeRange.endTime);
+
+      const actions = (activity.actions || []).map(a => {
+        const type = Object.keys(a.detail || {})[0];
+        return actionLabels[type] || type;
+      });
+
+      let who = 'Unknown';
+      if (actor && actor.user) {
+        if (actor.user.knownUser && actor.user.knownUser.isCurrentUser) {
+          who = 'Pemilik file';
+        } else if (actor.user.knownUser && actor.user.knownUser.personName) {
+          who = resolvePersonEmail(actor.user.knownUser.personName);
+        } else if (actor.user.unknownUser) {
+          who = 'Unknown User';
+        }
+      } else if (actor && actor.anonymous) {
+        who = 'Anonymous (via public link)';
+      }
+
+      return {
+        who,
+        actions: actions.join(', ') || 'Unknown action',
+        time: timestamp
+          ? new Date(timestamp).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })
+          : 'Waktu tidak diketahui'
+      };
+    });
+
+  } catch (e) {
+    Logger.log('[DLP] Tidak bisa cek activity: ' + fileName + ' - ' + e.message);
+    return null;
+  }
+}
+
+function resolvePersonEmail(personName) {
+  try {
+    const person = People.People.get(personName, {
+      personFields: 'emailAddresses,names'
+    });
+    return (person.emailAddresses && person.emailAddresses[0] && person.emailAddresses[0].value)
+      ? person.emailAddresses[0].value
+      : personName;
+  } catch (e) {
+    return personName;
+  }
+}
+
+
+// ============================================================
+// EMAIL ALERT 1: Violation (file baru bermasalah)
+// ============================================================
+function sendViolationAlert(violations) {
+  const timestamp = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+  const autoRevokeInfo = CONFIG.AUTO_REVOKE
+    ? '<p style="color:#c0392b;"><b>Auto-revoke AKTIF</b> — sharing yang melanggar sudah otomatis dicabut.</p>'
+    : '<p style="color:#e67e22;"><b>Auto-revoke NONAKTIF</b> — harap tindak lanjuti secara manual.</p>';
+
+  let htmlBody = `
+    <div style="font-family:Arial,sans-serif;max-width:700px;">
+      <div style="background:#c0392b;padding:16px 20px;border-radius:6px 6px 0 0;">
+        <h2 style="color:white;margin:0;">[DLP Alert] File Baru Sensitif Terdeteksi</h2>
+      </div>
+      <div style="border:1px solid #ddd;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
+        <p><b>Waktu:</b> ${timestamp} WIB</p>
+        <p><b>Total file bermasalah:</b> ${violations.length}</p>
+        ${autoRevokeInfo}
+        <hr>
+  `;
+
+  violations.forEach(({ file, issues }, index) => {
+    htmlBody += `
+      <div style="margin-bottom:16px;padding:12px;background:#fff8f8;border-left:4px solid #c0392b;border-radius:4px;">
+        <p style="margin:0 0 6px;">
+          <b>#${index + 1} &mdash; <a href="${file.webViewLink}">${file.name}</a></b>
+        </p>
+        <p style="margin:0 0 4px;color:#666;font-size:13px;">
+          Dibuat: ${new Date(file.createdTime).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB
+        </p>
+        <p style="margin:0 0 4px;color:#666;font-size:13px;">ID: ${file.id}</p>
+        <ul style="margin:8px 0 0;padding-left:20px;">
+          ${issues.map(i => `<li>${i}</li>`).join('')}
+        </ul>
+      </div>
+    `;
+  });
+
+  htmlBody += `
+        <hr>
+        <p style="color:#888;font-size:12px;">
+          Dikirim otomatis oleh Google Drive DLP Scanner &mdash; Ethic Ninja
+        </p>
+      </div>
+    </div>
+  `;
+
+  GmailApp.sendEmail(
+    CONFIG.ADMIN_EMAIL,
+    '[DLP Alert] ' + violations.length + ' file sensitif baru terdeteksi di Google Drive',
+    'Buka email ini dengan HTML viewer untuk melihat detail.',
+    { htmlBody }
+  );
+}
+
+
+// ============================================================
+// EMAIL ALERT 2: Activity pada file yang di-flag
+// ============================================================
+function sendActivityAlert(file, activities) {
+  const timestamp = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+
+  let htmlBody = `
+    <div style="font-family:Arial,sans-serif;max-width:700px;">
+      <div style="background:#e67e22;padding:16px 20px;border-radius:6px 6px 0 0;">
+        <h2 style="color:white;margin:0;">[Activity Alert] File Sensitif Diakses</h2>
+      </div>
+      <div style="border:1px solid #ddd;border-top:none;padding:20px;border-radius:0 0 6px 6px;">
+        <p><b>Waktu deteksi:</b> ${timestamp} WIB</p>
+        <p><b>File:</b> <a href="https://drive.google.com/file/d/${file.id}">${file.name}</a></p>
+        <p style="color:#666;font-size:13px;">ID: ${file.id}</p>
+        <p style="color:#666;font-size:13px;">
+          Di-flag sejak: ${new Date(file.flaggedAt).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB
+        </p>
+        <hr>
+        <h3>Aktivitas Terbaru (${activities.length}):</h3>
+  `;
+
+  activities.forEach((a, i) => {
+    htmlBody += `
+      <div style="padding:10px;background:#fff8f0;border-left:4px solid #e67e22;margin-bottom:10px;border-radius:4px;">
+        <p style="margin:0;"><b>#${i + 1}</b> &mdash; ${a.who}</p>
+        <p style="margin:4px 0 0;color:#333;font-size:13px;">Aksi: ${a.actions}</p>
+        <p style="margin:4px 0 0;color:#666;font-size:13px;">Waktu: ${a.time} WIB</p>
+      </div>
+    `;
+  });
+
+  htmlBody += `
+        <hr>
+        <p style="color:#888;font-size:12px;">
+          Dikirim otomatis oleh Google Drive DLP Scanner &mdash; Ethic Ninja
+        </p>
+      </div>
+    </div>
+  `;
+
+  GmailApp.sendEmail(
+    CONFIG.ADMIN_EMAIL,
+    '[Activity Alert] File sensitif "' + file.name + '" diakses',
+    'Buka email ini dengan HTML viewer untuk melihat detail.',
+    { htmlBody }
+  );
+}
+
+
+// ============================================================
+// DEBUG: Test setup keseluruhan
+// ============================================================
+function debugSetup() {
+  Logger.log('=== TRIGGERS ===');
+  ScriptApp.getProjectTriggers().forEach(t => {
+    Logger.log(t.getHandlerFunction() + ' - ' + t.getEventType());
+  });
+
+  Logger.log('\n=== FLAGGED FILES ===');
+  const files = getViolatingFiles();
+  Logger.log('Total: ' + files.length);
+  files.forEach((f, i) => {
+    Logger.log('#' + (i + 1) + ' ' + f.name + ' | ' + f.flaggedAt);
+  });
+
+  if (files.length > 0) {
+    Logger.log('\n=== TEST ACTIVITY CHECK ===');
+    const result = checkFileActivity(files[0].id, files[0].name);
+    Logger.log(result ? JSON.stringify(result) : 'Tidak ada aktivitas');
+  }
+}
